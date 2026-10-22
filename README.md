@@ -126,7 +126,25 @@ Bạn vui lòng tải và chạy phiên bản phù hợp với hệ điều hàn
 ````
 
 * Node đầu tiên dùng `--bootstrap` để tạo cluster mới.
-* Các node tiếp theo dùng `--join` để tham gia cluster.
+* Các node tiếp theo dùng `--join` để tham gia cluster. `--join` có thể trỏ tới bất kỳ node nào, request sẽ được chuyển về leader.
+* Node mới được thêm dạng non-voter, leader chờ node bắt kịp dữ liệu (tối đa 30 giây) rồi mới đưa thành voter. Node không bắt kịp sẽ bị gỡ ra và lệnh join trả lỗi.
+* Thay một node hỏng bằng máy mới (cùng `--id`, địa chỉ khác) chỉ cần chạy lại với `--join`; leader tự gỡ bản ghi cũ.
+
+### Chạy nhiều máy (production)
+
+```bash
+export SHORTLINK_CLUSTER_TOKEN='<chuỗi bí mật dùng chung cho mọi node>'
+./short_link --id=node1 --raft=10.0.0.1:12001 --bind=:8080 --public-url=https://s.example.com --bootstrap
+./short_link --id=node2 --raft=10.0.0.2:12001 --bind=:8080 --public-url=https://s.example.com --join=10.0.0.1:8080
+```
+
+| Flag | Ý nghĩa |
+|------|---------|
+| `--http-advertise` | Địa chỉ HTTP mà node khác dùng để gọi tới node này. Mặc định: host của `--raft` + port của `--bind`. |
+| `--public-url` | Domain dùng trong short link trả về. Nên đặt khi chạy thật; mặc định là `http://<http-advertise>` của leader. |
+| `--cluster-token` / `SHORTLINK_CLUSTER_TOKEN` | Bảo vệ `/join`, `/remove-server`, `/cluster/status`. Không đặt thì các endpoint này chỉ nhận request từ chính máy đó (loopback). Nên dùng biến môi trường thay vì flag để token không hiện trong `ps`. |
+| `--default-ttl` | Thời hạn mặc định của link khi request không truyền `ttl`/`expires_at` (ví dụ `720h`). Mặc định `0` = không hết hạn. |
+| `--expire-sweep-interval` | Chu kỳ leader xoá link đã hết hạn (mặc định `30s`). |
 
 ### 2. Restart các node khi cả cluster die
 
@@ -136,7 +154,19 @@ Bạn vui lòng tải và chạy phiên bản phù hợp với hệ điều hàn
 ./short_link --id=node3 --raft=127.0.0.1:12003 --bind=127.0.0.1:8083
 ```
 
-> Lưu ý: Khi restart không cần thêm `--bootstrap` hoặc `--join`, vì dữ liệu cluster đã được lưu.
+> Lưu ý: Khi restart không cần thêm `--bootstrap` hoặc `--join`, vì dữ liệu cluster đã được lưu. Nếu vẫn truyền `--join` thì leader chỉ cập nhật lại thông tin node; join lỗi mà node đã có dữ liệu cluster thì node vẫn chạy tiếp như bình thường.
+>
+> Node bị remove trong lúc đang tắt sẽ tự phát hiện sau khoảng 10 giây (hỏi các node khác) và trả `503`. Muốn đưa nó trở lại thì chạy lại với `--join`.
+
+### Dừng node
+
+Dừng bằng `Ctrl+C` hoặc `kill` (SIGTERM), **không dùng `kill -9`**. Node sẽ ngừng nhận request mới, chờ request đang chạy, nhường leader cho node khác (nếu đang là leader) và chụp snapshot trước khi tắt. Nhờ snapshot, node khởi động lại đọc được dữ liệu ngay cả khi chưa liên lạc được leader.
+
+Sau khi crash (`kill -9`, mất điện), node chỉ có dữ liệu tới snapshot gần nhất cho tới khi liên lạc được leader. Trong lúc đó, link không tìm thấy sẽ trả `503` thay vì `404`.
+
+### Nâng cấp từ phiên bản cũ
+
+Dừng **tất cả** node, thay binary rồi khởi động lại (không chạy lẫn phiên bản cũ và mới trong cùng cluster). Dữ liệu cũ (raft log và snapshot) được đọc lại bình thường, link cũ giữ nguyên ID; mỗi node tự đăng ký lại địa chỉ HTTP sau khi khởi động.
 
 ---
 
@@ -144,15 +174,42 @@ Bạn vui lòng tải và chạy phiên bản phù hợp với hệ điều hàn
 
 ### Tạo short link
 
+Chỉ nhận `POST`. Tham số `url` (bắt buộc, chỉ `http`/`https`, tối đa 2048 ký tự) có thể truyền qua query, form hoặc JSON body.
+
 ```bash
-curl -X POST 'http://127.0.0.1:8083/shorten?url=https%3A%2F%2Fwww.thegioididong.com' -H 'Content-Type: application/json'
+curl -X POST 'http://127.0.0.1:8083/shorten?url=https://www.thegioididong.com' -H 'Content-Type: application/json'
 ```
+
+Link có thời hạn: truyền `ttl` (số giây hoặc dạng `30m`, `24h`) **hoặc** `expires_at` (RFC3339 hoặc unix giây), tối đa 10 năm:
+
+```bash
+curl -X POST 'http://127.0.0.1:8083/shorten' -d 'url=https://www.thegioididong.com&ttl=24h'
+curl -X POST 'http://127.0.0.1:8083/shorten' -H 'Content-Type: application/json' -H 'Accept: application/json' \
+  -d '{"url":"https://www.thegioididong.com","expires_at":"2026-12-31T23:59:59+07:00"}'
+```
+
+Mặc định trả về short link dạng text. Gửi `Accept: application/json` để nhận `{"id","short_url","url","expires_at"}`.
+ID được sinh ngẫu nhiên (tối đa 11 ký tự base62) nên không đoán hay liệt kê được link.
+Khi cluster đang không có leader, API trả `503` kèm `Retry-After`; client nên thử lại.
 
 ### Lấy link gốc từ short link ID
 
 ```bash
 curl 'http://127.0.0.1:8082/d2bm043gbukitfpuujkg'
 ```
+
+* `302`: chuyển hướng tới link gốc.
+* `404`: không tồn tại.
+* `410`: link đã hết hạn. Leader xoá hẳn link hết hạn theo chu kỳ `--expire-sweep-interval`, sau đó sẽ trả `404`.
+* `503`: node này không còn là thành viên cluster (đã bị remove), hoặc vừa khởi động lại và chưa có đủ dữ liệu; client nên thử node khác.
+
+### Health check
+
+```bash
+curl 'http://127.0.0.1:8082/health'
+```
+
+Trả `200` khi node là thành viên cluster và đang có leader, ngược lại trả `503`. Dùng endpoint này cho load balancer để tự loại node đã bị remove hoặc bị tách khỏi cluster.
 
 ### Xóa node khỏi cluster khi node lỗi
 
@@ -161,6 +218,12 @@ Khi một node (ví dụ node2) bị lỗi và không thể phục hồi, để 
 ```bash
 curl 'http://127.0.0.1:8083/remove-server' -H 'Content-Type: application/json' -d '{"id":"node2"}'
 ```
+
+Có đặt `SHORTLINK_CLUSTER_TOKEN` thì thêm header `-H "Authorization: Bearer $SHORTLINK_CLUSTER_TOKEN"`.
+
+Trước khi xoá, leader kiểm tra các voter còn lại vẫn đủ quorum. Nếu không đủ (ví dụ xoá một node đang sống trong khi node khác đã chết) thì API trả `409` để tránh làm chết cả cluster. Hãy xoá node đã chết trước. Chỉ dùng `{"id":"node2","force":true}` khi chắc chắn mình biết hậu quả.
+
+Xoá chính leader: leader nhường quyền cho node khác trước rồi leader mới thực hiện việc xoá, nên cluster không bị gián đoạn ghi.
 
 Điều này giúp cluster hoạt động trơn tru, ổn định và giảm tải cho hệ thống.
 
